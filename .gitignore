@@ -1,0 +1,8 @@
+.claude/
+.idea/
+.vscode/
+.zed/
+.zig-cache/
+zig-out/
+zig-pkg/
+scratch/

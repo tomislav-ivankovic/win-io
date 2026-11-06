@@ -1,0 +1,21 @@
+.{
+    .name = .win_io,
+    .version = "0.17.0",
+    .fingerprint = 0xe6eccc7c867d0ef8, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        // Zig's source release, for std's tests (binary releases strip them)
+        // and the lib directory they are compiled against. Only fetched when
+        // this is the root project.
+        .zig = .{
+            .url = "https://ziglang.org/download/0.17.0/zig-0.17.0.tar.xz",
+            .hash = "zig-0.0.0-Fp4XJIigSQ53rKRZd-Did2CKDFHo81YfDC4lxCVTiXgE",
+            .lazy = true,
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

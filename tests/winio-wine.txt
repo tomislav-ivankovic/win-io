@@ -1,0 +1,24 @@
+# std tests failing under Wine with WinIo (zig 0.17.0, x86_64-windows, Debug)
+# Totals: 3236 passed, 66 skipped, 22 failed (3324 total). See README for the reasons.
+fs.test.test.access file
+fs.test.test.copyFile
+fs.test.test.directory operations on files
+fs.test.test.Dir.readLink
+fs.test.test.Dir.readLink on non-symlinks
+fs.test.test.Dir.realPath smoke test
+fs.test.test.Dir.statFile
+fs.test.test.Dir.statFile on a symlink
+fs.test.test.file operations on directories
+fs.test.test.File.stat on a File that is a symlink returns Kind.sym_link
+fs.test.test.max file name component lengths
+fs.test.test.openDir
+fs.test.test.open file with exclusive and shared nonblocking lock
+fs.test.test.open file with exclusive lock twice, make sure second lock waits
+fs.test.test.open file with exclusive nonblocking lock twice
+fs.test.test.open file with shared and exclusive nonblocking lock
+fs.test.test.read from locked file
+fs.test.test.readlink on Windows
+fs.test.test.statFile on dangling symlink
+Io.net.test.test.listen on an in use port
+Io.Threaded.test.test.toPrefixedFileW
+os.windows.nls.test.upcaseW matches RtlUpcaseUnicodeChar

@@ -1,0 +1,51 @@
+# std tests failing under Wine with stock std.Io.Threaded (zig 0.17.0, x86_64-windows, Debug)
+# Totals: 3209 passed, 66 skipped, 48 failed, 1 crashed (3324 total)
+Build.Cache.test.cache file and then recall it
+Build.Cache.test.check that changing a file causes cache miss
+Build.Cache.test.no file inputs
+Build.Cache.test.Manifest with files added after initial hash
+fs.test.test.Dir.readLink
+fs.test.test.Dir.readLink on non-symlinks
+fs.test.test.File.stat on a File that is a symlink returns Kind.sym_link
+fs.test.test.Dir.statFile on a symlink
+fs.test.test.openDir
+fs.test.test.Dir.realPath smoke test
+fs.test.test.file operations with follow_symlinks=false
+fs.test.test.Dir.statFile
+fs.test.test.statFile on dangling symlink
+fs.test.test.directory operations on files
+fs.test.test.file operations on directories
+fs.test.test.deleteTree does not follow symlinks
+fs.test.test.deleteTree on a symlink
+fs.test.test.max file name component lengths
+fs.test.test.access file
+fs.test.test.copyFile
+fs.test.test.open file with exclusive nonblocking lock twice
+fs.test.test.open file with shared and exclusive nonblocking lock
+fs.test.test.open file with exclusive and shared nonblocking lock
+fs.test.test.open file with exclusive lock twice, make sure second lock waits
+fs.test.test.open file with exclusive nonblocking lock twice (absolute paths)
+fs.test.test.read from locked file
+fs.test.test.use Lock.none to unlock files
+fs.test.test.readlink on Windows
+Io.Threaded.test.test.toPrefixedFileW
+Io.net.test.test.invalid but parseable IPv6 scope ids
+Io.net.test.test.resolve DNS
+Io.net.test.test.listen on an in use port
+Io.net.test.test.cancel accept
+Io.net.test.test.UDP send and receive
+Io.net.test.test.UDP sendTimeout and receiveTimeout
+Io.net.test.test.UDP sendMany 2 and receive 2
+Io.net.test.test.UDP sendManyTimeout 1 recvManyTimeout 2
+Io.net.test.test.UDP concurrency and timeouts
+os.windows.nls.test.upcaseW matches RtlUpcaseUnicodeChar
+Io.test.test.randomSecure
+http.test.test.trailers
+http.test.test.HTTP server handles a chunked transfer coding request
+http.test.test.echo content server
+http.test.test.Server.Request.respondStreaming non-chunked, unknown content-length
+http.test.test.receiving arbitrary http headers from the client
+http.test.test.general client/server API coverage
+http.test.test.Server streams both reading and writing
+http.test.test.redirect to different connection
+http.test.test.boot failed connections from the pool
