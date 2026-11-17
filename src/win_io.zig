@@ -63,6 +63,10 @@ null_handle: ?win.HANDLE = null,
 
 /// Whether `WSAStartup` was called. Protected by `mutex`.
 wsa_started: std.atomic.Value(bool) = .init(false),
+/// `WSACleanup`, set together with `wsa_started`. Calling it through this
+/// pointer keeps `ws2_32.dll` from being imported by programs that cannot
+/// start Winsock (see `Features`).
+wsa_cleanup: ?*const fn () callconv(.winapi) i32 = null,
 dl: Dl = .{},
 
 pub const InitOptions = Io.Threaded.InitOptions;
@@ -146,7 +150,9 @@ pub fn deinit(w: *WinIo) void {
 
 pub fn deinitWithOptions(w: *WinIo, options: DeinitOptions) void {
     w.join();
-    if (options.cleanup_winsock and w.wsa_started.load(.monotonic)) _ = win.WSACleanup();
+    if (options.cleanup_winsock) {
+        if (w.wsa_cleanup) |cleanup| _ = cleanup();
+    }
     if (w.null_handle) |handle| _ = win.CloseHandle(handle);
     w.* = undefined;
 }
@@ -164,135 +170,299 @@ fn join(w: *WinIo) void {
 
 /// Must stay comptime-callable: `std.testing.io` is a `const` computed from it.
 pub fn io(w: *WinIo) Io {
-    return .{ .userdata = w, .vtable = &vtable };
+    return w.ioWithFeatures(.all);
+}
+
+/// Like `io`, but the operations of disabled `features` are not compiled into
+/// the program. They fail with `error.Unimplemented` or
+/// `error.OperationUnsupported`, whichever their error set has first, or else
+/// with the error `std.Io.failing` returns, and log a warning once per
+/// operation in Debug builds.
+///
+/// Operations on something that only an enabled feature creates, such as
+/// awaiting a future, waiting for a child process or closing a socket, are
+/// illegal behavior: an instance must be used with one feature set only.
+pub fn ioWithFeatures(w: *WinIo, comptime features: Features) Io {
+    return .{ .userdata = w, .vtable = &FeatureVTable(features).vtable };
+}
+
+/// For `Io` values that WinIo uses internally, such as for clocks and queues
+/// or stored in the stderr writer. Using `io` there would compile every
+/// feature into every program.
+fn internalIo(w: *WinIo) Io {
+    return .{ .userdata = w, .vtable = &internal_vtable };
 }
 
 fn fromUserdata(userdata: ?*anyopaque) *WinIo {
     return @ptrCast(@alignCast(userdata));
 }
 
-const vtable: Io.VTable = .{
-    .crashHandler = crashHandler,
+/// Groups of operations that `ioWithFeatures` compiles into a program. All
+/// are disabled by default: list the ones the program uses.
+pub const Features = struct {
+    /// Spawning child processes (`std.process.spawn`), waiting for and killing
+    /// them, and `std.process.replace`.
+    process_spawn: bool = false,
+    /// Host name lookups (`std.Io.net.HostName.lookup`) and network interface
+    /// names. Without it, `dnsapi.dll` and `iphlpapi.dll` are not imported.
+    dns: bool = false,
+    /// Sockets. Without it, `ws2_32.dll` is not imported, but `dnsapi.dll` may
+    /// load it unless `dns` is disabled too.
+    net: bool = false,
+    /// Running tasks on other threads. Without it, `async` and `Group.async`
+    /// run the task before returning, and `concurrent` and `Group.concurrent`
+    /// fail with `error.ConcurrencyUnavailable`, like `init_single_threaded`.
+    /// `Io.Mutex`, `Io.Condition` and the other futex-based primitives still
+    /// work across threads spawned with `std.Thread`.
+    concurrency: bool = false,
+    /// Everything that takes a path: opening, creating and statting files and
+    /// directories, and real paths and symlinks. Also listing directories.
+    /// I/O on file and directory handles, such as stdio or inherited handles,
+    /// is always available.
+    fs: bool = false,
+    /// Creating directories, deleting, renaming, linking, atomic files, and
+    /// setting owners, permissions and timestamps. Requires `fs`.
+    fs_modify: bool = false,
 
-    .async = async,
-    .concurrent = concurrent,
-    .await = await,
-    .cancel = cancel,
-
-    .groupAsync = groupAsync,
-    .groupConcurrent = groupConcurrent,
-    .groupAwait = groupAwait,
-    .groupCancel = groupCancel,
-
-    .recancel = recancel,
-    .swapCancelProtection = swapCancelProtection,
-    .checkCancel = checkCancel,
-
-    .futexWait = futexWait,
-    .futexWaitUncancelable = futexWaitUncancelable,
-    .futexWake = futexWake,
-
-    .now = now,
-    .clockResolution = clockResolution,
-    .sleep = sleep,
-
-    .random = random,
-    .randomSecure = randomSecure,
-
-    .operate = operate,
-    .batchAwaitAsync = batchAwaitAsync,
-    .batchAwaitConcurrent = batchAwaitConcurrent,
-    .batchCancel = batchCancel,
-
-    .fileClose = fileClose,
-    .fileReadPositional = fileReadPositional,
-    .fileWritePositional = fileWritePositional,
-    .fileWriteFileStreaming = fileWriteFileStreaming,
-    .fileWriteFilePositional = fileWriteFilePositional,
-    .fileSeekBy = fileSeekBy,
-    .fileSeekTo = fileSeekTo,
-
-    .dirCreateDir = dirCreateDir,
-    .dirCreateDirPath = dirCreateDirPath,
-    .dirCreateDirPathOpen = dirCreateDirPathOpen,
-    .dirOpenDir = dirOpenDir,
-    .dirStat = dirStat,
-    .dirStatFile = dirStatFile,
-    .dirAccess = dirAccess,
-    .dirCreateFile = dirCreateFile,
-    .dirCreateFileAtomic = dirCreateFileAtomic,
-    .dirOpenFile = dirOpenFile,
-    .dirClose = dirClose,
-    .dirRead = dirRead,
-    .dirRealPath = dirRealPath,
-    .dirRealPathFile = dirRealPathFile,
-    .dirDeleteFile = dirDeleteFile,
-    .dirDeleteDir = dirDeleteDir,
-    .dirRename = dirRename,
-    .dirRenamePreserve = dirRenamePreserve,
-    .dirSymLink = dirSymLink,
-    .dirReadLink = dirReadLink,
-    .dirSetOwner = dirSetOwner,
-    .dirSetFileOwner = dirSetFileOwner,
-    .dirSetPermissions = dirSetPermissions,
-    .dirSetFilePermissions = dirSetFilePermissions,
-    .dirSetTimestamps = dirSetTimestamps,
-    .dirHardLink = dirHardLink,
-
-    .fileStat = fileStat,
-    .fileLength = fileLength,
-    .fileSync = fileSync,
-    .fileIsTty = fileIsTty,
-    .fileEnableAnsiEscapeCodes = fileEnableAnsiEscapeCodes,
-    .fileSupportsAnsiEscapeCodes = fileSupportsAnsiEscapeCodes,
-    .fileSetLength = fileSetLength,
-    .fileSetOwner = fileSetOwner,
-    .fileSetPermissions = fileSetPermissions,
-    .fileSetTimestamps = fileSetTimestamps,
-    .fileLock = fileLock,
-    .fileTryLock = fileTryLock,
-    .fileUnlock = fileUnlock,
-    .fileDowngradeLock = fileDowngradeLock,
-    .fileRealPath = fileRealPath,
-    .fileHardLink = fileHardLink,
-
-    .fileMemoryMapCreate = fileMemoryMapCreate,
-    .fileMemoryMapDestroy = fileMemoryMapDestroy,
-    .fileMemoryMapSetLength = fileMemoryMapSetLength,
-    .fileMemoryMapRead = fileMemoryMapRead,
-    .fileMemoryMapWrite = fileMemoryMapWrite,
-
-    .netListenIp = netListenIp,
-    .netAccept = netAccept,
-    .netBindIp = netBindIp,
-    .netConnectIp = netConnectIp,
-    .netListenUnix = netListenUnix,
-    .netConnectUnix = netConnectUnix,
-    .netSocketCreatePair = netSocketCreatePair,
-    .netWriteFile = netWriteFile,
-    .netClose = netClose,
-    .netShutdown = netShutdown,
-    .netInterfaceNameResolve = netInterfaceNameResolve,
-    .netInterfaceName = netInterfaceName,
-    .netLookup = netLookup,
-
-    .processExecutableOpen = processExecutableOpen,
-    .processExecutablePath = processExecutablePath,
-    .lockStderr = lockStderr,
-    .tryLockStderr = tryLockStderr,
-    .unlockStderr = unlockStderr,
-    .processCurrentPath = processCurrentPath,
-    .processSetCurrentDir = processSetCurrentDir,
-    .processSetCurrentPath = processSetCurrentPath,
-    .processReplace = processReplace,
-    .processSpawn = processSpawn,
-    .childWait = childWait,
-    .childKill = childKill,
-
-    .progressParentFile = progressParentFile,
-    .inheritParentDir = inheritParentDir,
-    .inheritParentFile = inheritParentFile,
+    pub const all: Features = .{
+        .process_spawn = true,
+        .dns = true,
+        .net = true,
+        .concurrency = true,
+        .fs = true,
+        .fs_modify = true,
+    };
+    pub const none: Features = .{};
 };
+
+const FeatureOperations = struct {
+    feature: []const u8,
+    /// Fail with an error when the feature is disabled.
+    operations: []const []const u8,
+    /// Operate on something that only the feature creates, so are illegal
+    /// when it is disabled.
+    dependent_operations: []const []const u8 = &.{},
+};
+
+/// `operate` and the batch functions are handled by `NetOps`, and `async` and
+/// `groupAsync` by `vtableEntry`.
+const feature_operations = [_]FeatureOperations{
+    .{
+        .feature = "process_spawn",
+        .operations = &.{ "processSpawn", "processReplace" },
+        .dependent_operations = &.{ "childWait", "childKill" },
+    },
+    .{
+        .feature = "dns",
+        .operations = &.{ "netLookup", "netInterfaceNameResolve", "netInterfaceName" },
+    },
+    .{
+        .feature = "net",
+        .operations = &.{
+            "netListenIp",         "netAccept",     "netBindIp",
+            "netConnectIp",        "netListenUnix", "netConnectUnix",
+            "netSocketCreatePair", "netWriteFile",  "netShutdown",
+        },
+        .dependent_operations = &.{"netClose"},
+    },
+    .{
+        .feature = "concurrency",
+        .operations = &.{ "concurrent", "groupConcurrent" },
+        .dependent_operations = &.{ "await", "cancel", "groupAwait", "groupCancel" },
+    },
+    .{
+        .feature = "fs",
+        .operations = &.{
+            "dirOpenDir", "dirStatFile", "dirAccess",       "dirCreateFile", "dirOpenFile",
+            "dirRead",    "dirRealPath", "dirRealPathFile", "dirReadLink",   "fileRealPath",
+        },
+    },
+    .{
+        .feature = "fs_modify",
+        .operations = &.{
+            "dirCreateDir",    "dirCreateDirPath",   "dirCreateDirPathOpen",  "dirCreateFileAtomic",
+            "dirDeleteFile",   "dirDeleteDir",       "dirRename",             "dirRenamePreserve",
+            "dirSymLink",      "dirHardLink",        "fileHardLink",          "dirSetOwner",
+            "dirSetFileOwner", "dirSetPermissions",  "dirSetFilePermissions", "dirSetTimestamps",
+            "fileSetOwner",    "fileSetPermissions", "fileSetTimestamps",
+        },
+    },
+};
+
+/// A type, so that each feature set has a single vtable.
+fn FeatureVTable(comptime features: Features) type {
+    return struct {
+        const vtable: Io.VTable = v: {
+            if (features.fs_modify and !features.fs) @compileError("Features.fs_modify requires Features.fs");
+            @setEvalBranchQuota(20_000);
+            var v: Io.VTable = undefined;
+            for (@typeInfo(Io.VTable).@"struct".field_names) |name| {
+                @field(v, name) = vtableEntry(features, name);
+            }
+            break :v v;
+        };
+    };
+}
+
+/// The function of the same name, unless `features` disables it. The
+/// functions of disabled operations are never referenced, so they are neither
+/// analyzed nor compiled.
+fn vtableEntry(comptime features: Features, comptime name: []const u8) @FieldType(Io.VTable, name) {
+    const eql = std.mem.eql;
+    const net_ops = NetOps(features.net);
+    if (@hasDecl(net_ops, name)) return @field(net_ops, name);
+    if (!features.concurrency) {
+        // These run the task inline.
+        if (eql(u8, name, "async")) return Io.failing.vtable.async;
+        if (eql(u8, name, "groupAsync")) return Io.failing.vtable.groupAsync;
+    }
+    for (feature_operations) |group| {
+        if (@field(features, group.feature)) continue;
+        for (group.operations) |operation| {
+            if (eql(u8, operation, name)) return disabledOperation(name, group.feature, false);
+        }
+        for (group.dependent_operations) |operation| {
+            if (eql(u8, operation, name)) return disabledOperation(name, group.feature, true);
+        }
+    }
+    return @field(WinIo, name);
+}
+
+/// Internal uses (see `internalIo`) only need clocks, futexes, randomness,
+/// cancelation and I/O on handles. Everything else is `std.Io.failing`'s:
+/// stubs from `disabledOperation` would add a function per operation to
+/// every program, and the batch functions a copy of them without sockets to
+/// programs that use `net`.
+const internal_vtable: Io.VTable = v: {
+    @setEvalBranchQuota(20_000);
+    var v: Io.VTable = undefined;
+    for (@typeInfo(Io.VTable).@"struct".field_names) |name| {
+        @field(v, name) = if (std.mem.startsWith(u8, name, "batch") or isFeatureOperation(name))
+            @field(Io.failing.vtable, name)
+        else
+            vtableEntry(.none, name);
+    }
+    break :v v;
+};
+
+/// Whether some feature replaces the vtable entry `name` when disabled.
+fn isFeatureOperation(comptime name: []const u8) bool {
+    const eql = std.mem.eql;
+    if (eql(u8, name, "async") or eql(u8, name, "groupAsync")) return true;
+    for (feature_operations) |group| {
+        for (group.operations) |operation| if (eql(u8, operation, name)) return true;
+        for (group.dependent_operations) |operation| if (eql(u8, operation, name)) return true;
+    }
+    return false;
+}
+
+/// The vtable entry for operation `name` of a disabled `feature`. See
+/// `ioWithFeatures`.
+fn disabledOperation(
+    comptime name: []const u8,
+    comptime feature: []const u8,
+    comptime dependent: bool,
+) @FieldType(Io.VTable, name) {
+    if (comptime std.mem.eql(u8, name, "netLookup")) return &disabledNetLookup;
+    const info = @typeInfo(@typeInfo(@FieldType(Io.VTable, name)).pointer.child).@"fn";
+    const R = info.return_type.?;
+    const P = info.param_types;
+    const Impl = struct {
+        var warned: std.atomic.Value(bool) = .init(false);
+
+        fn call(args: anytype) R {
+            if (dependent) {
+                illegalOperation(name, feature);
+            } else {
+                warnDisabled(&warned, name, feature);
+                const E = switch (@typeInfo(R)) {
+                    .error_union => |eu| eu.error_set,
+                    .error_set => R,
+                    else => @compileError(name ++ " cannot fail, so it must be a dependent operation"),
+                };
+                if (comptime hasError(E, "Unimplemented")) return error.Unimplemented;
+                if (comptime hasError(E, "OperationUnsupported")) return error.OperationUnsupported;
+                return @call(.auto, @field(Io.failing.vtable, name), args);
+            }
+        }
+    };
+    return switch (P.len) {
+        1 => &struct {
+            fn f(a: P[0].?) R {
+                return Impl.call(.{a});
+            }
+        }.f,
+        2 => &struct {
+            fn f(a: P[0].?, b: P[1].?) R {
+                return Impl.call(.{ a, b });
+            }
+        }.f,
+        3 => &struct {
+            fn f(a: P[0].?, b: P[1].?, c: P[2].?) R {
+                return Impl.call(.{ a, b, c });
+            }
+        }.f,
+        4 => &struct {
+            fn f(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?) R {
+                return Impl.call(.{ a, b, c, d });
+            }
+        }.f,
+        5 => &struct {
+            fn f(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?) R {
+                return Impl.call(.{ a, b, c, d, e });
+            }
+        }.f,
+        6 => &struct {
+            fn f(a: P[0].?, b: P[1].?, c: P[2].?, d: P[3].?, e: P[4].?, g: P[5].?) R {
+                return Impl.call(.{ a, b, c, d, e, g });
+            }
+        }.f,
+        else => @compileError("unsupported parameter count for " ++ name),
+    };
+}
+
+/// `HostName.lookup` must close the queue even on error, which
+/// `std.Io.failing` does not do.
+fn disabledNetLookup(
+    userdata: ?*anyopaque,
+    host_name: HostName,
+    resolved: *Io.Queue(HostName.LookupResult),
+    options: HostName.LookupOptions,
+) HostName.LookupError!void {
+    _ = host_name;
+    _ = options;
+    const S = struct {
+        var warned: std.atomic.Value(bool) = .init(false);
+    };
+    warnDisabled(&S.warned, "netLookup", "dns");
+    resolved.close(fromUserdata(userdata).internalIo());
+    return error.NetworkDown;
+}
+
+fn hasError(comptime E: type, comptime name: []const u8) bool {
+    const names = @typeInfo(E).error_set.error_names orelse return true; // anyerror
+    for (names) |n| if (std.mem.eql(u8, n, name)) return true;
+    return false;
+}
+
+/// Logs the first call of a disabled operation, which `warned` records. Not
+/// generic, so that the formatting code is compiled once, not per operation.
+fn warnDisabled(warned: *std.atomic.Value(bool), name: []const u8, feature: []const u8) void {
+    if (!is_debug) return;
+    if (warned.swap(true, .monotonic)) return;
+    std.log.warn("WinIo: {s} called, but Features.{s} is disabled", .{ name, feature });
+}
+
+/// For operations on something that only an enabled feature creates. Not
+/// generic, like `warnDisabled`.
+fn illegalOperation(name: []const u8, feature: []const u8) noreturn {
+    @branchHint(.cold);
+    if (std.debug.runtime_safety) std.debug.panic(
+        "WinIo: {s} called through an Io with Features.{s} disabled, on something created through an Io with it enabled",
+        .{ name, feature },
+    );
+    unreachable;
+}
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -1601,7 +1771,7 @@ fn futexWait(userdata: ?*anyopaque, ptr: *const u32, expected: u32, timeout: Io.
     }
     const w = fromUserdata(userdata);
     const timeout_ns: ?u64 = ns: {
-        const d = timeout.toDurationFromNow(w.io()) orelse break :ns null;
+        const d = timeout.toDurationFromNow(w.internalIo()) orelse break :ns null;
         break :ns std.math.lossyCast(u64, d.raw.toNanoseconds());
     };
     return Thread.futexWait(ptr, expected, timeout_ns);
@@ -2376,7 +2546,27 @@ fn deviceIoControl(o: *const Io.Operation.DeviceIoControl) Io.Cancelable!std.os.
 // ---------------------------------------------------------------------------
 // Operations and batches
 
-fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+/// The vtable entries for operations and batches, with or without sockets.
+fn NetOps(comptime net_enabled: bool) type {
+    return struct {
+        pub fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
+            return WinIo.operate(net_enabled, userdata, operation);
+        }
+        pub fn batchAwaitAsync(userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
+            return WinIo.batchAwaitAsync(net_enabled, userdata, b);
+        }
+        pub fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
+            return WinIo.batchAwaitConcurrent(net_enabled, userdata, b, timeout);
+        }
+        pub fn batchCancel(userdata: ?*anyopaque, b: *Io.Batch) void {
+            _ = userdata;
+            cancelPending(net_enabled, b);
+        }
+    };
+}
+
+/// Without `net_enabled`, socket operations are illegal: no socket can exist.
+fn operate(comptime net_enabled: bool, userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Operation.Result {
     const w = fromUserdata(userdata);
     switch (operation) {
         .file_read_streaming => |o| return .{
@@ -2392,11 +2582,11 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
             },
         },
         .device_io_control => |*o| return .{ .device_io_control = try deviceIoControl(o) },
-        .net_receive => |*o| return .{ .net_receive = r: {
+        .net_receive => |*o| if (!net_enabled) illegalOperation("operate(.net_receive)", "net") else return .{ .net_receive = r: {
             ensureWinsock(w) catch |err| break :r .{ err, 0 };
             break :r try netReceive(o.socket_handle, o.message_buffer, o.data_buffer, o.flags);
         } },
-        .net_send => |*o| return .{
+        .net_send => |*o| if (!net_enabled) illegalOperation("operate(.net_send)", "net") else return .{
             .net_send = r: {
                 ensureWinsock(w) catch |err| break :r .{ err, 0 };
                 const send_err, const sent = netSend(o.socket_handle, o.messages, o.flags);
@@ -2413,13 +2603,13 @@ fn operate(userdata: ?*anyopaque, operation: Io.Operation) Io.Cancelable!Io.Oper
                 break :r .{ null, sent };
             },
         },
-        .net_read => |o| return .{
+        .net_read => |o| if (!net_enabled) illegalOperation("operate(.net_read)", "net") else return .{
             .net_read = netRead(o.socket_handle, o.data) catch |err| switch (err) {
                 error.Canceled => |e| return e,
                 else => |e| e,
             },
         },
-        .net_write => |o| return .{
+        .net_write => |o| if (!net_enabled) illegalOperation("operate(.net_write)", "net") else return .{
             // Windows doesn't have the concept of control/ancillary data.
             .net_write = netWrite(o.socket_handle, o.header, o.data, o.splat) catch |err| switch (err) {
                 error.Canceled => |e| return e,
@@ -2549,7 +2739,7 @@ fn batchRemovePending(b: *Io.Batch, operation_userdata: *BatchOperationUserdata)
 
 /// Moves the pending operations whose I/O has finished to the completed list,
 /// or to the unused list if they were canceled.
-fn batchCollect(b: *Io.Batch) void {
+fn batchCollect(comptime net_enabled: bool, b: *Io.Batch) void {
     var index = b.pending.head;
     while (index != .none) {
         const pending = &b.storage[index.toIndex()].pending;
@@ -2574,7 +2764,8 @@ fn batchCollect(b: *Io.Batch) void {
                     else => comptime unreachable,
                 });
             },
-            inline .net_receive, .net_read => |tag| {
+            // Without `net_enabled`, `batchDrainSubmitted` has not submitted any.
+            inline .net_receive, .net_read => |tag| if (!net_enabled) unreachable else {
                 var flags: u32 = 0;
                 const code: ?win.WSA_ERROR = if (win.WSAGetOverlappedResult(toSocket(operation_userdata.handle), overlapped, &bytes, win.FALSE, &flags) != 0)
                     null
@@ -2608,17 +2799,22 @@ fn batchCollect(b: *Io.Batch) void {
 
 /// Collects finished operations. Returns whether the caller has to wait on
 /// the batch's event: operations are pending and none has completed.
-fn batchMustWait(b: *Io.Batch) bool {
+fn batchMustWait(comptime net_enabled: bool, b: *Io.Batch) bool {
     if (b.pending.head == .none) return false;
     // Reset before collecting, so that an operation finishing in the meantime
     // leaves the event signaled for the next wait.
     _ = win.ResetEvent(@ptrCast(b.userdata.?));
-    batchCollect(b);
+    batchCollect(net_enabled, b);
     return b.pending.head != .none and b.completed.head == .none;
 }
 
 /// If `concurrency` is false, `error.ConcurrencyUnavailable` is unreachable.
-fn batchDrainSubmitted(userdata: ?*anyopaque, b: *Io.Batch, concurrency: bool) (Io.ConcurrentError || Io.Cancelable)!void {
+fn batchDrainSubmitted(
+    comptime net_enabled: bool,
+    userdata: ?*anyopaque,
+    b: *Io.Batch,
+    concurrency: bool,
+) (Io.ConcurrentError || Io.Cancelable)!void {
     const w = fromUserdata(userdata);
     var index = b.submitted.head;
     errdefer b.submitted.head = index;
@@ -2701,7 +2897,7 @@ fn batchDrainSubmitted(userdata: ?*anyopaque, b: *Io.Batch, concurrency: bool) (
                 if (concurrency) return error.ConcurrencyUnavailable;
                 batchComplete(b, operation_userdata, .{ .device_io_control = try deviceIoControl(o) });
             },
-            .net_receive => |*o| o: {
+            .net_receive => |*o| if (!net_enabled) illegalOperation("batch net_receive", "net") else o: {
                 ensureWinsock(w) catch |err| {
                     batchComplete(b, operation_userdata, .{ .net_receive = .{ err, 0 } });
                     break :o;
@@ -2737,7 +2933,7 @@ fn batchDrainSubmitted(userdata: ?*anyopaque, b: *Io.Batch, concurrency: bool) (
                     else => |err| batchComplete(b, operation_userdata, .{ .net_receive = .{ receiveError(err), 0 } }),
                 };
             },
-            .net_read => |*o| o: {
+            .net_read => |*o| if (!net_enabled) illegalOperation("batch net_read", "net") else o: {
                 var bufs: [max_iovecs_len]win.WSABUF = undefined;
                 var len: u32 = 0;
                 for (o.data) |buf| addWsaBuf(&bufs, &len, buf);
@@ -2766,27 +2962,27 @@ fn batchDrainSubmitted(userdata: ?*anyopaque, b: *Io.Batch, concurrency: bool) (
                 };
             },
             // Sending rarely blocks for long, so it is done before returning.
-            .net_send, .net_write => batchComplete(b, operation_userdata, try operate(userdata, submission.operation)),
+            .net_send, .net_write => batchComplete(b, operation_userdata, try operate(net_enabled, userdata, submission.operation)),
         }
         index = submission.node.next;
     }
     b.submitted = .{ .head = .none, .tail = .none };
 }
 
-fn batchAwaitAsync(userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
+fn batchAwaitAsync(comptime net_enabled: bool, userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
     defer batchReleaseEvent(b);
-    batchDrainSubmitted(userdata, b, false) catch |err| switch (err) {
+    batchDrainSubmitted(net_enabled, userdata, b, false) catch |err| switch (err) {
         error.ConcurrencyUnavailable => unreachable, // passed concurrency=false
         else => |e| {
-            cancelPending(b);
+            cancelPending(net_enabled, b);
             return e;
         },
     };
-    while (batchMustWait(b)) {
+    while (batchMustWait(net_enabled, b)) {
         // A canceler interrupts the wait with an APC, so cancelation must be
         // checked after every wakeup, not only before the first wait.
         const alertable_syscall = AlertableSyscall.start() catch |err| {
-            cancelPending(b);
+            cancelPending(net_enabled, b);
             return err;
         };
         _ = win.WaitForSingleObjectEx(@ptrCast(b.userdata.?), win.INFINITE, win.TRUE);
@@ -2794,18 +2990,23 @@ fn batchAwaitAsync(userdata: ?*anyopaque, b: *Io.Batch) Io.Cancelable!void {
     }
 }
 
-fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout) Io.Batch.AwaitConcurrentError!void {
+fn batchAwaitConcurrent(
+    comptime net_enabled: bool,
+    userdata: ?*anyopaque,
+    b: *Io.Batch,
+    timeout: Io.Timeout,
+) Io.Batch.AwaitConcurrentError!void {
     const w = fromUserdata(userdata);
-    const deadline: ?Io.Clock.Timestamp = timeout.toTimestamp(w.io());
+    const deadline: ?Io.Clock.Timestamp = timeout.toTimestamp(w.internalIo());
     defer batchReleaseEvent(b);
-    batchDrainSubmitted(userdata, b, true) catch |err| {
-        cancelPending(b);
+    batchDrainSubmitted(net_enabled, userdata, b, true) catch |err| {
+        cancelPending(net_enabled, b);
         return err;
     };
-    while (batchMustWait(b)) {
+    while (batchMustWait(net_enabled, b)) {
         const ms: u32 = if (deadline) |d| millisecondsUntil(d) orelse 0 else win.INFINITE;
         const alertable_syscall = AlertableSyscall.start() catch |err| {
-            cancelPending(b);
+            cancelPending(net_enabled, b);
             return err;
         };
         const rc = win.WaitForSingleObjectEx(@ptrCast(b.userdata.?), ms, win.TRUE);
@@ -2813,8 +3014,8 @@ fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout
         if (rc == win.WAIT_TIMEOUT) {
             // Although spurious timeouts are OK, when no deadline is passed
             // we must not return `error.Timeout`.
-            if (timeout != .none and batchMustWait(b)) {
-                cancelPending(b);
+            if (timeout != .none and batchMustWait(net_enabled, b)) {
+                cancelPending(net_enabled, b);
                 if (b.completed.head == .none) return error.Timeout;
             }
         }
@@ -2828,7 +3029,7 @@ fn batchAwaitConcurrent(userdata: ?*anyopaque, b: *Io.Batch, timeout: Io.Timeout
 /// abandon the batch after `error.Timeout` or `error.Canceled` without
 /// calling `Batch.cancel`. Canceled operations are dropped from the batch;
 /// ones that completed in the meantime remain available via `Batch.next`.
-fn cancelPending(b: *Io.Batch) void {
+fn cancelPending(comptime net_enabled: bool, b: *Io.Batch) void {
     defer batchReleaseEvent(b);
     if (b.pending.head == .none) return;
     var index = b.pending.head;
@@ -2841,15 +3042,10 @@ fn cancelPending(b: *Io.Batch) void {
     const event: win.HANDLE = @ptrCast(b.userdata.?);
     while (true) {
         _ = win.ResetEvent(event);
-        batchCollect(b);
+        batchCollect(net_enabled, b);
         if (b.pending.head == .none) break;
         _ = win.WaitForSingleObjectEx(event, win.INFINITE, win.FALSE);
     }
-}
-
-fn batchCancel(userdata: ?*anyopaque, b: *Io.Batch) void {
-    _ = userdata;
-    cancelPending(b);
 }
 
 // ---------------------------------------------------------------------------
@@ -4227,11 +4423,12 @@ fn dirCreateFileAtomic(
     dest_path: []const u8,
     options: Dir.CreateFileAtomicOptions,
 ) Dir.CreateFileAtomicError!File.Atomic {
-    const w = fromUserdata(userdata);
-    const w_io = w.io();
+    // Calls the implementations directly rather than through an `Io`, which
+    // would compile every feature into the program (see `internalIo`).
     if (Dir.path.dirname(dest_path)) |dirname| {
+        const defaults: Dir.CreateDirPathOpenOptions = .{};
         const new_dir = if (options.make_path)
-            dir.createDirPathOpen(w_io, dirname, .{}) catch |err| switch (err) {
+            dirCreateDirPathOpen(userdata, dir, dirname, defaults.permissions, defaults.open_options) catch |err| switch (err) {
                 // None of these make sense in this context.
                 error.IsDir,
                 error.Streaming,
@@ -4247,16 +4444,16 @@ fn dirCreateFileAtomic(
                 else => |e| return e,
             }
         else
-            try dir.openDir(w_io, dirname, .{});
+            try dirOpenDir(userdata, dir, dirname, .{});
 
-        return atomicFileInit(w_io, Dir.path.basename(dest_path), options.permissions, new_dir, true);
+        return atomicFileInit(userdata, Dir.path.basename(dest_path), options.permissions, new_dir, true);
     }
 
-    return atomicFileInit(w_io, dest_path, options.permissions, dir, false);
+    return atomicFileInit(userdata, dest_path, options.permissions, dir, false);
 }
 
 fn atomicFileInit(
-    w_io: Io,
+    userdata: ?*anyopaque,
     dest_basename: []const u8,
     permissions: File.Permissions,
     dir: Dir,
@@ -4264,9 +4461,9 @@ fn atomicFileInit(
 ) Dir.CreateFileAtomicError!File.Atomic {
     while (true) {
         var random_integer: u64 = undefined;
-        w_io.random(@ptrCast(&random_integer));
+        random(userdata, @ptrCast(&random_integer));
         const tmp_sub_path = std.fmt.hex(random_integer);
-        const file = dir.createFile(w_io, &tmp_sub_path, .{
+        const file = dirCreateFile(userdata, dir, &tmp_sub_path, .{
             .permissions = permissions,
             .exclusive = true,
         }) catch |err| switch (err) {
@@ -4542,6 +4739,7 @@ fn ensureWinsock(w: *WinIo) error{ NetworkDown, SystemResources, Unexpected }!vo
         @backingInt(win.WSA_ERROR.EPROCLIM) => return error.SystemResources,
         else => |code| return unexpectedWsaError(@fromBackingInt(@intCast(code))),
     }
+    w.wsa_cleanup = &win.WSACleanup;
     w.wsa_started.store(true, .release);
 }
 
@@ -4832,7 +5030,7 @@ fn netConnectIp(
     options: net.IpAddress.ConnectOptions,
 ) net.IpAddress.ConnectError!net.Socket {
     const w = fromUserdata(userdata);
-    const deadline = options.timeout.toTimestamp(w.io());
+    const deadline = options.timeout.toTimestamp(w.internalIo());
     const socket = try openSocket(w, ipFamily(address), options.mode, options.protocol);
     errdefer closeSocket(socket);
     var storage: PosixAddress = undefined;
@@ -5320,7 +5518,7 @@ fn netLookup(
     options: HostName.LookupOptions,
 ) HostName.LookupError!void {
     const w = fromUserdata(userdata);
-    defer resolved.close(w.io());
+    defer resolved.close(w.internalIo());
     netLookupFallible(w, host_name, resolved, options) catch |err| switch (err) {
         error.Closed => unreachable, // `resolved` must not be closed until `netLookup` returns
         else => |e| return e,
@@ -5340,7 +5538,7 @@ fn netLookupFallible(
     resolved: *Io.Queue(HostName.LookupResult),
     options: HostName.LookupOptions,
 ) (HostName.LookupError || Io.QueueClosedError)!void {
-    const w_io = w.io();
+    const w_io = w.internalIo();
     const name = host_name.bytes;
     assert(name.len <= HostName.max_len);
 
@@ -5510,7 +5708,7 @@ fn lookupDnsQuery(
     resolved: *Io.Queue(HostName.LookupResult),
     options: HostName.LookupOptions,
 ) (HostName.LookupError || Io.QueueClosedError)!void {
-    const w_io = w.io();
+    const w_io = w.internalIo();
     const types: []const windows.DNS.TYPE = if (options.family) |family| switch (family) {
         .ip4 => &.{.A},
         .ip6 => &.{.AAAA},
@@ -5592,7 +5790,7 @@ const LookupDns = struct {
         assert(!lookup_dns.done);
         defer lookup_dns.dnsapi.DnsFree(lookup_dns.results.pQueryRecords, .RecordList);
         if (lookup_dns.results.QueryStatus != .SUCCESS) return;
-        const w_io = lookup_dns.win_io.io();
+        const w_io = lookup_dns.win_io.internalIo();
         var record_it = lookup_dns.results.pQueryRecords;
         while (record_it) |record| : (record_it = record.pNext) switch (record.wType) {
             else => {},
@@ -5655,7 +5853,7 @@ fn lookupHosts(
     defer _ = win.CloseHandle(handle);
 
     var line_buf: [512]u8 = undefined;
-    var file_reader = file.reader(w.io(), &line_buf);
+    var file_reader = file.reader(w.internalIo(), &line_buf);
     return lookupHostsReader(w, host_name, resolved, options, &file_reader.interface) catch |err| switch (err) {
         error.ReadFailed => switch (file_reader.err.?) {
             error.Canceled => |e| return e,
@@ -5678,7 +5876,7 @@ fn lookupHostsReader(
     options: HostName.LookupOptions,
     reader: *Io.Reader,
 ) error{ ReadFailed, Canceled, UnknownHostName, Closed }!void {
-    const w_io = w.io();
+    const w_io = w.internalIo();
     var addresses_len: usize = 0;
     var canonical_name: ?HostName = null;
     while (true) {
@@ -5910,7 +6108,7 @@ fn tryLockStderr(userdata: ?*anyopaque, terminal_mode: ?Io.Terminal.Mode) Io.Can
 
 fn initLockedStderr(w: *WinIo, terminal_mode: ?Io.Terminal.Mode) Io.Cancelable!Io.LockedStderr {
     if (!w.stderr_writer_initialized) {
-        const w_io = w.io();
+        const w_io = w.internalIo();
         w.stderr_writer.file = .{
             .handle = getStdHandle(.ERROR) orelse undefined,
             .flags = .{ .nonblocking = false },
@@ -6954,4 +7152,5 @@ test {
     _ = @import("win_io/single_threaded_test.zig");
     _ = @import("win_io/deinit_test.zig");
     _ = @import("win_io/unix_socket_test.zig");
+    _ = @import("win_io/features_test.zig");
 }

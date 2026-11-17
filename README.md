@@ -30,8 +30,11 @@ references the module when targeting Windows (for example behind
 const std = @import("std");
 const WinIo = @import("win_io");
 
-pub fn main(init: std.process.Init) !void {
-    var win_io: WinIo = .init(init.gpa, .{ .environ = init.minimal.environ });
+// Route std.debug output through WinIo too (see "Binary size and features").
+pub const std_options_debug_io: std.Io = WinIo.global_single_threaded.io();
+
+pub fn main(init: std.process.Init.Minimal) !void {
+    var win_io: WinIo = .init(std.heap.smp_allocator, .{ .environ = init.environ });
     defer win_io.deinit();
     const io = win_io.io();
     // ...
@@ -62,6 +65,66 @@ allocator and fails with `error.OutOfMemory`.
 var win_io: WinIo = .init_single_threaded; // or WinIo.global_single_threaded
 const io = win_io.io();
 ```
+
+## Binary size and features
+
+std uses its own `std.Io.Threaded` in two places that a WinIo program does not
+need. Each one compiles all of Threaded into the program next to WinIo:
+
+- `std.debug` (`print`, panics, stack traces) uses `std.Options.debug_io`,
+  which is `Threaded.global_single_threaded` by default. Declare
+  `std_options_debug_io` in the root file, as in the example above.
+- `main(init: std.process.Init)` makes `start.zig` create a Threaded instance
+  for `init.io`. Take `std.process.Init.Minimal` instead, which has the
+  arguments and environment, and pass WinIo an allocator.
+
+For a ReleaseSmall program that writes "hi" to stdout, the first one is the
+difference between 502.5 KiB and 190.5 KiB, and the second adds 46.5 KiB.
+
+`io()` has every `std.Io` operation. `ioWithFeatures` only has the groups of
+operations a program enables; the code of the others is not analyzed,
+compiled or linked, so the program gets smaller and builds faster. Every
+`Features` field defaults to `false`: list the ones the program uses
+(`Features.all` enables every one).
+
+```zig
+const features: WinIo.Features = .{ .concurrency = true, .fs = true, .fs_modify = true };
+pub const std_options_debug_io: std.Io = WinIo.global_single_threaded.ioWithFeatures(features);
+// ...
+const io = win_io.ioWithFeatures(features);
+```
+
+| `Features` field | Operations | Saved when disabled |
+|---|---|---|
+| `process_spawn` | `std.process.spawn` and `replace`, waiting for and killing children | 47.5 KiB |
+| `dns` | host name lookups, network interface names; drops the `dnsapi.dll` and `iphlpapi.dll` imports | 14.5 KiB |
+| `concurrency` | `async`/`Group.async` (then run inline), `concurrent`, `Group.concurrent` | 11.5 KiB |
+| `net` | sockets; drops the `ws2_32.dll` import | 11.0 KiB |
+| `fs` | everything that takes a path, and listing directories | 11.0 KiB |
+| `fs_modify` | creating directories, deleting, renaming, links, atomic files, setting owners, permissions and timestamps; requires `fs` | 7.0 KiB |
+
+Savings are for the ReleaseSmall program above with every other feature
+enabled (190.5 KiB with `Features.all`, 93.5 KiB with `.{}`). Each group saves the
+most in programs that do not use it at all. Always available: I/O on file and directory handles (stdio, inherited
+handles, `Dir.cwd()`), clocks, sleeping, futexes and the primitives built on
+them (`Io.Mutex`, `Io.Condition`, ...), randomness, cancelation, batches,
+memory mapping, file locks, the executable and current paths, and stderr
+locking.
+
+Disabled operations behave like `std.Io.failing`: they return
+`error.Unimplemented` or `error.OperationUnsupported` if their error set has
+one, otherwise the error `std.Io.failing` returns, as if the file system were
+empty and full and there were no network (`dirOpenFile` returns
+`error.FileNotFound`, `dirCreateDir` `error.NoSpaceLeft`, `netListenIp`
+`error.NetworkDown`, `concurrent` `error.ConcurrencyUnavailable`). Listing a
+directory finds no entries. In Debug builds, each disabled operation logs a
+warning the first time it is called. Without `concurrency`, `async` runs the
+task before returning, as with `init_single_threaded`.
+
+Use one feature set per instance. Operations on something that only an
+enabled feature creates (awaiting a future, waiting for a child process,
+closing a socket) are illegal behavior with the feature disabled: they panic
+in Debug and ReleaseSafe builds.
 
 There are no dependencies. All Win32 API bindings (functions, structures and
 constants) are declared in `src/win_api.zig`, since std's `std.os.windows`
@@ -118,7 +181,13 @@ zig build test -fwine                    # this project's unit tests
 zig build test-std -fwine                # std's tests with std.testing.io = WinIo
 zig build test-std -fwine -Dio=threaded  # same tests with stock Threaded (baseline)
 zig build test-std -fwine -Dtest-filter=fs.test -Dtest-filter=Io.net.test
+zig build test -fwine -Dsingle-threaded  # as built by a -fsingle-threaded project
+zig build test-features -fwine           # a program per WinIo.Features set
 ```
+
+`test-features` builds a program with all features, with each one disabled
+alone, and with none, and checks that the DLLs of disabled features are not
+loaded.
 
 On Windows, drop `-fwine`. `net.has_unix_sockets` is false unless the target's
 minimum Windows version is at least 10 RS4, which the default `x86_64-windows`
